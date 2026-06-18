@@ -19,7 +19,7 @@ ap = argparse.ArgumentParser()
 ap.add_argument("--dir", required=True)
 ap.add_argument("--manifest", required=True)
 ap.add_argument("--sub", type=int, default=1500)   # taxa for Mantel permutation
-ap.add_argument("--perms", type=int, default=999)
+ap.add_argument("--perms", type=int, default=299)
 ap.add_argument("--minf", type=int, default=20)
 ap.add_argument("--seed", type=int, default=42)
 args = ap.parse_args()
@@ -94,32 +94,41 @@ def utri(M):
     iu = np.triu_indices(M.shape[0], 1)
     return M[iu]
 
-def mantel(Dx, Dy, perms, rng):
+def rank_matrix(D):
+    """Symmetric matrix whose upper-tri entries are ranked once (Spearman prep).
+    Lets permutations reindex precomputed ranks instead of calling rankdata each time."""
     from scipy.stats import rankdata
-    x = rankdata(utri(Dx)); y = rankdata(utri(Dy))
-    r = np.corrcoef(x, y)[0, 1]
-    n = Dx.shape[0]
+    n = D.shape[0]
+    iu = np.triu_indices(n, 1)
+    r = rankdata(D[iu])
+    R = np.zeros((n, n))
+    R[iu] = r
+    R[(iu[1], iu[0])] = r
+    return R
+
+def mantel(Dx, Dy, perms, rng):
+    n = Dx.shape[0]; iu = np.triu_indices(n, 1)
+    rx = rank_matrix(Dx)[iu]
+    RY = rank_matrix(Dy); ry = RY[iu]
+    r = np.corrcoef(rx, ry)[0, 1]
     cnt = 1
     for _ in range(perms):
         p = rng.permutation(n)
-        yp = rankdata(utri(Dy[np.ix_(p, p)]))
-        if np.corrcoef(x, yp)[0, 1] >= r:
+        if np.corrcoef(rx, RY[np.ix_(p, p)][iu])[0, 1] >= r:
             cnt += 1
     return r, cnt / (perms + 1)
 
 def partial_mantel(Dx, Dy, Dz, perms, rng):
-    # partial correlation of Dx,Dy controlling Dz, permuting Dx labels
-    from scipy.stats import rankdata
-    x = rankdata(utri(Dx)); y = rankdata(utri(Dy)); z = rankdata(utri(Dz))
+    n = Dx.shape[0]; iu = np.triu_indices(n, 1)
+    RX = rank_matrix(Dx); rx = RX[iu]
+    ry = rank_matrix(Dy)[iu]; rz = rank_matrix(Dz)[iu]
     def pcor(a, b, c):
         rab = np.corrcoef(a, b)[0, 1]; rac = np.corrcoef(a, c)[0, 1]; rbc = np.corrcoef(b, c)[0, 1]
         return (rab - rac * rbc) / (np.sqrt(1 - rac**2) * np.sqrt(1 - rbc**2) + 1e-12)
-    r = pcor(x, y, z)
-    n = Dx.shape[0]; cnt = 1
+    r = pcor(rx, ry, rz); cnt = 1
     for _ in range(perms):
         p = rng.permutation(n)
-        xp = rankdata(utri(Dx[np.ix_(p, p)]))
-        if pcor(xp, y, z) >= r:
+        if pcor(RX[np.ix_(p, p)][iu], ry, rz) >= r:
             cnt += 1
     return r, cnt / (perms + 1)
 
@@ -134,21 +143,16 @@ def subsample(accs, k, rng):
     return np.sort(rng.choice(idx, k, replace=False))
 
 def probe(X, y):
-    from sklearn.linear_model import LogisticRegression
-    from sklearn.model_selection import StratifiedKFold
-    from sklearn.preprocessing import StandardScaler
-    # keep classes with >=5 members
+    # fast cosine-kNN family classification, 5-fold CV
+    from sklearn.neighbors import KNeighborsClassifier
+    from sklearn.model_selection import cross_val_score
     c = Counter(y); keep = [i for i, l in enumerate(y) if c[l] >= 5]
-    Xk = X[keep]; yk = np.array(y)[keep]
-    Xs = StandardScaler().fit_transform(Xk)
-    skf = StratifiedKFold(5, shuffle=True, random_state=42)
-    accs = []
-    for tr, te in skf.split(Xs, yk):
-        m = LogisticRegression(max_iter=2000, C=1.0)
-        m.fit(Xs[tr], yk[tr]); accs.append(m.score(Xs[te], yk[te]))
-    # chance = sum p_i^2 (proportional) baseline
+    Xk = X[keep].astype(np.float32); yk = np.array(y)[keep]
+    Xn = Xk / (np.linalg.norm(Xk, axis=1, keepdims=True) + 1e-9)
+    knn = KNeighborsClassifier(n_neighbors=15, metric="cosine")
+    sc = cross_val_score(knn, Xn, yk, cv=5)
     p = np.array(list(Counter(yk).values())) / len(yk)
-    return float(np.mean(accs)), float(np.std(accs)), float((p**2).sum()), len(yk), len(set(yk))
+    return float(sc.mean()), float(sc.std()), float((p**2).sum()), len(yk), len(set(yk))
 
 print("=" * 70)
 for name, (X, accs) in mats.items():
@@ -174,7 +178,7 @@ for name, (X, accs) in mats.items():
             continue
         ti = subsample([accs[i] for i in ti], min(args.sub, len(ti)), rng) if len(ti) > args.sub else np.array(ti)
         ta = [accs[i] for i in ti]
-        rr, ppv = mantel(cos_dist(X[ti]), tax_dist(ta), 199, rng)
+        rr, ppv = mantel(cos_dist(X[ti]), tax_dist(ta), 99, rng)
         print(f"  tier {tier:24s} Mantel r={rr:+.3f} p={ppv:.3f}  n={len(ta)}")
 
     # ---- per family (n>=minf): does within-family structure exist?
@@ -186,7 +190,7 @@ for name, (X, accs) in mats.items():
         fi = [i for i in range(len(accs)) if fams[i] == fam]
         fa = [accs[i] for i in fi]
         # within a family, taxonomy distance uses genus/species ranks
-        rr, ppv = mantel(cos_dist(X[fi]), tax_dist(fa), 199, rng)
+        rr, ppv = mantel(cos_dist(X[fi]), tax_dist(fa), 99, rng)
         print(f"     {fam:22s} n={c:4d}  r={rr:+.3f} p={ppv:.3f}")
 
     # ---- classification probe
